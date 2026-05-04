@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import re
 from dataclasses import dataclass
@@ -438,16 +438,7 @@ Do not output explanations, markdown fences, or the SQLQuery prefix.
 Use only tables and columns that exist in the schema.
 Limit results to at most {top_k} rows unless the user explicitly asks for a different count.
 
-Generation rules:
-- Prefer schema-grounded predicates over literal text matching.
-- If the question mentions a department, major, college, or program name, join department when needed and filter on department.dept_name.
-- If the question asks for remaining seats, use cnu_courses.capacity > cnu_courses.enrolled.
-- If the question asks about weekdays or class times, join course_schedule on (subject_code, section).
-- course_schedule can contain multiple rows per lecture, so use DISTINCT when joining it unless the user explicitly asks for each meeting row.
-- If the question asks for a count, generate COUNT(*).
-- If analysis.category_filter.broad_category is true, join subject and use a prefix predicate such as subject.category LIKE '교양%'. Never replace it with one narrower exact value.
-- If analysis.category_filter.match_mode is exact, join subject and use an exact predicate such as subject.category = '교양(소양)'.
-- Preserve user literals unless the matched database values show a better grounded equivalent.
+
 
 Schema:
 {ddl_info}
@@ -580,8 +571,8 @@ def main() -> None:
     )
 
     questions = [
-        "화요일 전공기초 과목들을 찾아줘",
-        "교양 과목들을 찾아줘",
+        "잔여석이 남아있는 화요일 기계공학과 전공 과목들을 찾아줘",
+        "원격 교양 과목들을 찾아줘",
     ]
 
     print("Tables:", list(db.get_usable_table_names()))
