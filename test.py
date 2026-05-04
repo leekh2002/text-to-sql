@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import re
 from dataclasses import dataclass
@@ -509,7 +509,7 @@ def main() -> None:
 
     questions = [
         "화요일 전공기초 과목들을 찾아줘",
-        "교양 과목들을 찾아줘",
+        "원격교양 과목들을 찾아줘",
     ]
 
     print("Tables:", list(db.get_usable_table_names()))
