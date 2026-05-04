@@ -7,22 +7,30 @@ from typing import Any
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_community.utilities import SQLDatabase
-from langchain_openai import ChatOpenAI
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine, URL
 
+try:
+    from langchain_anthropic import ChatAnthropic
+except ImportError as exc:
+    raise ImportError(
+        "langchain-anthropic 패키지가 필요합니다. "
+        "`pip install langchain-anthropic`로 설치한 뒤 다시 실행하세요."
+    ) from exc
 
+
+# 자주 쓰는 예시 질문과 키워드를 상수로 모아 둔다.
 K_ALL_LECTURES = "모든 강의를 보여줘"
-K_WEDNESDAY_ONLY = "수요일 과목만 보여줘"
+K_TUESDAY_ONLY = "화요일 과목만 보여줘"
 K_LIBERAL_ARTS = "교양 과목들을 찾아줘"
 K_LIBERAL_ARTS_SOYANG = "교양(소양) 과목들을 찾아줘"
 K_NO_FRIDAY_LIBERAL_ARTS = "금요일 강의를 제외한 교양 과목들을 찾아줘"
-K_CS_DEPT = "컴퓨터인공지능학부에서 개설한 강의를 보여줘"
-K_REMAINING_SEATS = "잔여석이 남아있는 과목을 보여줘"
-K_EE_REMAINING_SEATS = "잔여석이 남아있는 전기공학과 과목들을 찾아줘"
+K_CS_DEPT = "컴퓨터공학부에서 개설한 강의를 보여줘"
+K_REMAINING_SEATS = "여유석이 남아있는 과목을 보여줘"
+K_EE_REMAINING_SEATS = "여유석이 남아있는 전기공학과 과목들을 찾아줘"
 K_ELECTRICAL_ENGINEERING = "전기공학과"
 K_DEPARTMENT = "학과"
-K_COLLEGE = "학부"
+K_COLLEGE = "단과대"
 K_WEEKDAYS = [
     "월요일",
     "화요일",
@@ -54,19 +62,20 @@ DEFAULT_TOP_K = 5
 VALUE_LOOKUP_LIMIT = 30
 MAX_REPAIR_ATTEMPTS = 1
 
+# 모델이 SQL 패턴을 안정적으로 따라오도록 대표 예시를 제공한다.
 QUERY_EXAMPLES = [
     QueryExample(
         question=K_ALL_LECTURES,
         sql="SELECT c.* FROM cnu_courses AS c LIMIT {top_k};",
     ),
     QueryExample(
-        question=K_WEDNESDAY_ONLY,
+        question=K_TUESDAY_ONLY,
         sql=(
             "SELECT DISTINCT c.* "
             "FROM cnu_courses AS c "
             "JOIN course_schedule AS cs "
             "ON c.subject_code = cs.subject_code AND c.section = cs.section "
-            "WHERE cs.day_of_week = '수' "
+            "WHERE cs.day_of_week = '화' "
             "LIMIT {top_k};"
         ),
     ),
@@ -112,7 +121,7 @@ QUERY_EXAMPLES = [
             "SELECT DISTINCT c.* "
             "FROM cnu_courses AS c "
             "JOIN department AS d ON c.dept_code = d.dept_code "
-            "WHERE d.dept_name LIKE '%컴퓨터인공지능학부%' "
+            "WHERE d.dept_name LIKE '%컴퓨터공학부%' "
             "LIMIT {top_k};"
         ),
     ),
@@ -134,6 +143,7 @@ QUERY_EXAMPLES = [
 
 
 def build_postgres_url() -> str:
+    """환경변수 값을 사용해 PostgreSQL 연결 문자열을 만든다."""
     url = URL.create(
         drivername="postgresql+psycopg2",
         username=os.getenv("POSTGRES_USER", "postgres"),
@@ -146,10 +156,15 @@ def build_postgres_url() -> str:
 
 
 def normalize_whitespace(text_value: str) -> str:
+    """연속 공백을 하나로 줄여 질문 파싱을 안정화한다."""
     return re.sub(r"\s+", " ", text_value).strip()
 
 
 def extract_category_semantics(question: str) -> dict[str, Any] | None:
+    """
+    질문에 포함된 과목 구분 키워드를 해석한다.
+    예: 교양 -> broad prefix, 교양(소양) -> exact match
+    """
     for prefix in CATEGORY_PREFIX_TERMS:
         if f"{prefix}(" in question:
             match = re.search(rf"({re.escape(prefix)}\([^)]+\))", question)
@@ -175,23 +190,29 @@ def extract_category_semantics(question: str) -> dict[str, Any] | None:
 
 
 def normalize_question(question: str) -> str:
+    """
+    원문 질문은 유지하되, 모델이 놓치기 쉬운 도메인 규칙을 보조 힌트로 덧붙인다.
+    """
     question = normalize_whitespace(question)
     hints: list[str] = []
 
-    if "잔여석" in question:
+    if "여유석" in question or "잔여석" in question:
         hints.append(
-            "Use the actual remaining-seat condition from the schema, such as cnu_courses.capacity > cnu_courses.enrolled, instead of matching the literal text."
+            "Use the actual remaining-seat condition from the schema, such as "
+            "cnu_courses.capacity > cnu_courses.enrolled, instead of matching the literal text."
         )
 
     if K_ELECTRICAL_ENGINEERING in question or K_DEPARTMENT in question or K_COLLEGE in question:
         hints.append(
-            "A department or major name may require a JOIN from cnu_courses to department using dept_code and filtering on department.dept_name."
+            "A department or major name may require a JOIN from cnu_courses to department "
+            "using dept_code and filtering on department.dept_name."
         )
 
     if any(day in question for day in K_WEEKDAYS):
         weekday_map = ", ".join(f"{k} -> {v}" for k, v in K_WEEKDAY_TO_DB.items())
         hints.append(
-            "Time information is stored in course_schedule, not in cnu_courses. Join course_schedule by (subject_code, section) and use course_schedule.day_of_week. "
+            "Time information is stored in course_schedule, not in cnu_courses. "
+            "Join course_schedule by (subject_code, section) and use course_schedule.day_of_week. "
             f"Weekday mapping: {weekday_map}."
         )
 
@@ -199,17 +220,21 @@ def normalize_question(question: str) -> str:
     if category_semantics:
         if category_semantics["broad_category"]:
             hints.append(
-                f"When the user says {category_semantics['raw_text']} without a parenthesized subtype, interpret it as a broad category and prefer subject.category LIKE '{category_semantics['normalized_value']}%'."
+                f"When the user says {category_semantics['raw_text']} without a parenthesized subtype, "
+                f"interpret it as a broad category and prefer subject.category LIKE "
+                f"'{category_semantics['normalized_value']}%'."
             )
         else:
             hints.append(
-                f"When the user explicitly says {category_semantics['raw_text']}, treat it as an exact category value for subject.category."
+                f"When the user explicitly says {category_semantics['raw_text']}, "
+                "treat it as an exact category value for subject.category."
             )
 
     return question if not hints else question + "\n\nDomain hints:\n- " + "\n- ".join(hints)
 
 
 def normalize_sql(raw_sql: str) -> str:
+    """모델 응답에서 SQL 본문만 추출해 실행 가능한 형태로 정리한다."""
     sql = raw_sql.strip()
     sql = re.sub(r"^SQLQuery:\s*", "", sql, flags=re.IGNORECASE)
 
@@ -221,11 +246,22 @@ def normalize_sql(raw_sql: str) -> str:
 
 
 def run_query(engine: Engine, sql: str) -> pd.DataFrame:
+    """생성된 SQL을 실행하고 결과를 데이터프레임으로 반환한다."""
     with engine.connect() as conn:
         return pd.read_sql_query(text(sql), conn)
 
 
-def safe_fetch_values(engine: Engine, table: str, column: str, tokens: list[str], limit: int = VALUE_LOOKUP_LIMIT) -> list[str]:
+def safe_fetch_values(
+    engine: Engine,
+    table: str,
+    column: str,
+    tokens: list[str],
+    limit: int = VALUE_LOOKUP_LIMIT,
+) -> list[str]:
+    """
+    질문 토큰으로 실제 DB 값을 미리 조회해 모델 프롬프트에 넣는다.
+    조회 실패 시 전체 흐름을 막지 않도록 빈 리스트를 반환한다.
+    """
     if not tokens:
         return []
 
@@ -233,6 +269,7 @@ def safe_fetch_values(engine: Engine, table: str, column: str, tokens: list[str]
         with engine.connect() as conn:
             conditions = []
             params: dict[str, Any] = {"limit": limit}
+
             for idx, token in enumerate(tokens):
                 key = f"token_{idx}"
                 conditions.append(f"{column} ILIKE :{key}")
@@ -253,12 +290,17 @@ def safe_fetch_values(engine: Engine, table: str, column: str, tokens: list[str]
 
 
 def extract_korean_tokens(question: str) -> list[str]:
+    """질문에서 한글, 영문, 숫자 기반 토큰만 추려 중복 없이 반환한다."""
     tokens = re.findall(r"[가-힣A-Za-z0-9()]+", question)
     filtered = [token for token in tokens if len(token) >= 2]
     return list(dict.fromkeys(filtered))
 
 
 def build_value_context(engine: Engine, question: str) -> str:
+    """
+    질문과 매칭되는 실제 값 후보를 DB에서 찾아 프롬프트에 공급한다.
+    이 단계가 있으면 모델이 임의 값을 지어낼 가능성이 줄어든다.
+    """
     inspector = inspect(engine)
     tables = set(inspector.get_table_names())
     tokens = extract_korean_tokens(question)
@@ -276,6 +318,7 @@ def build_value_context(engine: Engine, question: str) -> str:
     for table, column in lookups:
         if table not in tables:
             continue
+
         values = safe_fetch_values(engine, table, column, tokens)
         if values:
             joined = ", ".join(values[:VALUE_LOOKUP_LIMIT])
@@ -285,6 +328,7 @@ def build_value_context(engine: Engine, question: str) -> str:
 
 
 def build_examples(top_k: int) -> str:
+    """Few-shot 예시를 하나의 프롬프트 블록으로 합친다."""
     blocks = []
     for idx, example in enumerate(QUERY_EXAMPLES, start=1):
         blocks.append(
@@ -296,6 +340,7 @@ def build_examples(top_k: int) -> str:
 
 
 def extract_json_object(text_value: str) -> dict[str, Any]:
+    """모델 응답에서 JSON 객체 부분만 잘라 파싱한다."""
     match = re.search(r"\{.*\}", text_value, flags=re.DOTALL)
     if not match:
         raise ValueError("No JSON object found in model response.")
@@ -303,6 +348,7 @@ def extract_json_object(text_value: str) -> dict[str, Any]:
 
 
 def build_analysis_seed(question: str) -> dict[str, Any]:
+    """질문에서 미리 해석한 카테고리 힌트를 분석 프롬프트에 주입한다."""
     category_semantics = extract_category_semantics(question)
     seed: dict[str, Any] = {}
     if category_semantics:
@@ -310,7 +356,16 @@ def build_analysis_seed(question: str) -> dict[str, Any]:
     return seed
 
 
-def analyze_question(llm: ChatOpenAI, ddl_info: str, question: str, value_context: str) -> dict[str, Any]:
+def analyze_question(
+    llm: ChatAnthropic,
+    ddl_info: str,
+    question: str,
+    value_context: str,
+) -> dict[str, Any]:
+    """
+    SQL 생성 전에 모델에게 의도, 조인, 필터 구조를 JSON으로 먼저 계획하게 한다.
+    이렇게 분리하면 최종 SQL 생성 품질이 안정적이다.
+    """
     analysis_seed = build_analysis_seed(question)
     seed_json = json.dumps(analysis_seed, ensure_ascii=False, indent=2)
 
@@ -358,8 +413,10 @@ JSON format:
 
     response = llm.invoke(prompt).content
     analysis = extract_json_object(response)
+
     if "category_filter" not in analysis and "category_filter" in analysis_seed:
         analysis["category_filter"] = analysis_seed["category_filter"]
+
     return analysis
 
 
@@ -370,6 +427,7 @@ def build_sql_prompt(
     value_context: str,
     top_k: int,
 ) -> str:
+    """분석 결과와 few-shot 예시를 합쳐 최종 SQL 생성 프롬프트를 만든다."""
     examples = build_examples(top_k)
     analysis_json = json.dumps(analysis, ensure_ascii=False, indent=2)
 
@@ -380,16 +438,7 @@ Do not output explanations, markdown fences, or the SQLQuery prefix.
 Use only tables and columns that exist in the schema.
 Limit results to at most {top_k} rows unless the user explicitly asks for a different count.
 
-Generation rules:
-- Prefer schema-grounded predicates over literal text matching.
-- If the question mentions a department, major, college, or program name, join department when needed and filter on department.dept_name.
-- If the question asks for remaining seats, use cnu_courses.capacity > cnu_courses.enrolled.
-- If the question asks about weekdays or class times, join course_schedule on (subject_code, section).
-- course_schedule can contain multiple rows per lecture, so use DISTINCT when joining it unless the user explicitly asks for each meeting row.
-- If the question asks for a count, generate COUNT(*).
-- If analysis.category_filter.broad_category is true, join subject and use a prefix predicate such as subject.category LIKE '교양%'. Never replace it with one narrower exact value.
-- If analysis.category_filter.match_mode is exact, join subject and use an exact predicate such as subject.category = '교양(소양)'.
-- Preserve user literals unless the matched database values show a better grounded equivalent.
+
 
 Schema:
 {ddl_info}
@@ -410,7 +459,7 @@ SQLQuery:
 
 
 def repair_sql(
-    llm: ChatOpenAI,
+    llm: ChatAnthropic,
     ddl_info: str,
     question: str,
     bad_sql: str,
@@ -419,6 +468,7 @@ def repair_sql(
     top_k: int,
     analysis: dict[str, Any],
 ) -> str:
+    """실행 실패 시 DB 에러를 바탕으로 SQL을 한 번 더 수정한다."""
     analysis_json = json.dumps(analysis, ensure_ascii=False, indent=2)
     prompt = f"""
 You are repairing a PostgreSQL query for a Korean university course database.
@@ -455,7 +505,14 @@ Rules:
     return normalize_sql(llm.invoke(prompt).content)
 
 
-def generate_sql(engine: Engine, db: SQLDatabase, llm: ChatOpenAI, question: str, top_k: int = DEFAULT_TOP_K) -> str:
+def generate_sql(
+    engine: Engine,
+    db: SQLDatabase,
+    llm: ChatAnthropic,
+    question: str,
+    top_k: int = DEFAULT_TOP_K,
+) -> str:
+    """질문 하나를 받아 실행 가능한 SQL만 생성한다."""
     ddl_info = db.get_table_info()
     normalized_question = normalize_question(question)
     value_context = build_value_context(engine, normalized_question)
@@ -467,10 +524,11 @@ def generate_sql(engine: Engine, db: SQLDatabase, llm: ChatOpenAI, question: str
 def execute_with_repair(
     engine: Engine,
     db: SQLDatabase,
-    llm: ChatOpenAI,
+    llm: ChatAnthropic,
     question: str,
     top_k: int = DEFAULT_TOP_K,
 ) -> tuple[str, pd.DataFrame]:
+    """SQL 생성, 실행, 실패 시 1회 복구까지 한 번에 수행한다."""
     ddl_info = db.get_table_info()
     normalized_question = normalize_question(question)
     value_context = build_value_context(engine, normalized_question)
@@ -484,6 +542,7 @@ def execute_with_repair(
         except Exception as exc:
             if attempt >= MAX_REPAIR_ATTEMPTS:
                 raise
+
             sql = repair_sql(
                 llm=llm,
                 ddl_info=ddl_info,
@@ -499,17 +558,21 @@ def execute_with_repair(
 
 
 def main() -> None:
+    """환경을 초기화하고 예시 질문 몇 개를 실행한다."""
     load_dotenv()
 
     connect_url = build_postgres_url()
     engine = create_engine(connect_url)
     db = SQLDatabase.from_uri(connect_url)
-    llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"), temperature=0)
-    #print(db.get_table_info())
+    llm = ChatAnthropic(
+        model=os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+        api_key=os.getenv("ANTHROPIC_API_KEY"),
+        temperature=0,
+    )
 
     questions = [
         "화요일 전공기초 과목들을 찾아줘",
-        "원격교양 과목들을 찾아줘",
+        "교양 과목들을 찾아줘",
     ]
 
     print("Tables:", list(db.get_usable_table_names()))
