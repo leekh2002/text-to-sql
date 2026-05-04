@@ -3,6 +3,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any
+from validate import validate_generated_sql
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -582,6 +583,7 @@ def main() -> None:
         print(f"\nQuestion: {question}")
         print(f"Executable SQL:\n{sql}")
         print(f"Result:\n{result_df}\n")
+        print(validate_generated_sql(sql, requested_student_id="20240001"))
 
 
 if __name__ == "__main__":
